@@ -33,5 +33,5 @@ jobs:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ghcr.io/${{ env.OWNER }}/gemma4-discord-salad:1
+          tags: ghcr.io/${{ env.OWNER }}/gemma4-discord-salad:2
           labels: org.opencontainers.image.source=https://github.com/${{ github.repository }}
