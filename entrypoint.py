@@ -25,6 +25,7 @@ import threading
 import time
 import traceback
 import urllib.parse
+import urllib.error
 import urllib.request
 
 import cloud
@@ -81,10 +82,55 @@ class Cfg:
 
 
 # --------------------------------------------------------------------------- salad calls
-def _post(url, headers, body=None, timeout=30):
-    req = urllib.request.Request(url, data=body, method="POST", headers=headers)
+# Salad's API sits behind a web firewall that rejects Python's default user-agent with a 403,
+# so always identify ourselves explicitly.
+UA = "gemma4-salad/1.0 (+https://github.com/Scrappy-Boys/gemma4-discord-salad)"
+
+
+def _http(url, method, headers, body=None, timeout=30):
+    req = urllib.request.Request(url, data=body, method=method,
+                                 headers={"User-Agent": UA, "Accept": "application/json", **headers})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.status
+
+
+def _post(url, headers, body=None, timeout=30):
+    return _http(url, "POST", headers, body, timeout)
+
+
+def _describe(e):
+    """Error text including the server's response body, which says why a request was refused."""
+    if isinstance(e, urllib.error.HTTPError):
+        try:
+            return f"{e} | {e.read()[:300].decode('utf-8', 'replace')}"
+        except Exception:
+            pass
+    return str(e)
+
+
+def group_url(cfg):
+    q = lambda x: urllib.parse.quote(x, safe="")
+    return (f"{cfg.salad_base}/api/public/organizations/{q(cfg.org)}/projects/{q(cfg.project)}"
+            f"/containers/{q(cfg.group)}")
+
+
+def check_salad_access(cfg):
+    """Before spending hours training, make sure we are allowed to stop this group afterwards."""
+    if not (cfg.salad_key and cfg.org and cfg.project and cfg.group):
+        return False
+    try:
+        _http(group_url(cfg), "GET", {"Salad-Api-Key": cfg.salad_key}, timeout=20)
+        log("Salad API check passed (this container is allowed to stop its own group)")
+        return True
+    except urllib.error.HTTPError as e:
+        if e.code in (401, 403, 404):
+            log(f"SALAD API CHECK FAILED: {_describe(e)}")
+            return False
+        log(f"Salad API check inconclusive ({_describe(e)}); continuing")
+        return True
+    except Exception as e:
+        log(f"Salad API check inconclusive ({e}); continuing")
+        return True
 
 
 def stop_group(cfg):
@@ -93,16 +139,14 @@ def stop_group(cfg):
         log("SALAD_API_KEY / ORGANIZATION_NAME / PROJECT_NAME / CONTAINER_GROUP_NAME not all set;"
             " cannot stop the container group automatically. STOP IT BY HAND in the Salad portal.")
         return False
-    q = lambda s: urllib.parse.quote(s, safe="")
-    url = (f"{cfg.salad_base}/api/public/organizations/{q(cfg.org)}/projects/{q(cfg.project)}"
-           f"/containers/{q(cfg.group)}/stop")
+    url = group_url(cfg) + "/stop"
     for attempt in range(5):
         try:
             status = _post(url, {"Salad-Api-Key": cfg.salad_key})
             log(f"stop request accepted (HTTP {status})")
             return True
         except Exception as e:
-            log(f"stop request failed (attempt {attempt + 1}/5): {e}")
+            log(f"stop request failed (attempt {attempt + 1}/5): {_describe(e)}")
             time.sleep(min(30, 3 * (attempt + 1)))
     return False
 
@@ -397,6 +441,14 @@ def main():
         shutdown(cfg, "wall-clock budget exceeded", code=1)
 
     preflight(cfg)
+
+    if not check_salad_access(cfg):
+        log("NOT TRAINING: the Salad key or the organization/project/group names are wrong, so this "
+            "container could not stop itself afterwards and would bill forever. Fix SALAD_API_KEY, "
+            "ORGANIZATION_NAME, PROJECT_NAME, CONTAINER_GROUP_NAME in the Salad portal, then restart. "
+            "STOP THE GROUP in the portal if you are not fixing it now.")
+        time.sleep(min(600, cfg.shutdown_wait))
+        sys.exit(1)
 
     out_dir = os.path.join(cfg.workdir, "outputs")
     tail = []
